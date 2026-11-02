@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the following paper."
+title: "Algorithmic Non-dimensionalisation of Polynomial Dynamical Systems with CRNNondim"
+authors:
+  - family-names: "Hawi"
+    given-names: "Georgio"
+  - family-names: "Wechselberger"
+    given-names: "Martin"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Hawi"
+      given-names: "Georgio"
+    - family-names: "Wechselberger"
+      given-names: "Martin"
+  title: "Algorithmic Non-dimensionalisation of Polynomial Dynamical Systems with CRNNondim"
+  year: 2026

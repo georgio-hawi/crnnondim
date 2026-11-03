@@ -13,6 +13,7 @@ from .utils import (
     export_crnnondim_results,
     _normalise_dimensionally_consistent_sets,
     _scale_dimension_groups,
+    _validate_scale_symbols,
 )
 from ._LEXIWrapper import _LEXIWrapper
 from .process_CRN_given_nondimensionalisation import process_CRN_given_nondimensionalisation
@@ -21,7 +22,7 @@ def process_CRN(
     S: sp.Matrix,
     V,
     X: List[sp.Symbol],
-    fixed_K: Optional[Dict[sp.Symbol, sp.Symbol]] = None,
+    fixed_K: Dict[sp.Symbol, sp.Symbol],
     find_example_nondim: bool = True,
     verbose: bool = False,
     basis_type: str = "Laurent",
@@ -37,8 +38,9 @@ def process_CRN(
         V: Reaction monomials; can be a sequence of sympy expressions or an
             sp.Matrix column vector.
         X (List[sp.Symbol]): Species symbols corresponding to rows of S.
-        fixed_K (Optional[Dict[sp.Symbol, sp.Symbol]]): Optional mapping
-            species_symbol -> fixed scale symbol to encode prior choices.
+        fixed_K (Dict[sp.Symbol, sp.Symbol]): Required nonempty mapping
+            species_symbol -> fixed scale symbol. Other species choose among
+            these scales; the routine does not introduce arbitrary new scales.
         find_example_nondim (bool): If True, also construct one example
             nondimensionalisation family (symbolically).
         verbose (bool): If True, print diagnostic banners and summaries.
@@ -85,12 +87,12 @@ def process_CRN(
     n = P.rows
 
     # --- Build fixed index mapping from species->scale_symbol ---
-    fixed_K = fixed_K or {}
+    if not fixed_K:
+        raise ValueError("fixed_K must contain at least one fixed species scale.")
     if (not hasattr(fixed_K, "items") or not set(fixed_K).issubset(set(X))
             or not all(isinstance(scale, sp.Symbol) for scale in fixed_K.values())):
         raise ValueError("fixed_K must map species in X to SymPy scale symbols.")
-    if len(set(map(str, fixed_K.values()))) != len(set(fixed_K.values())):
-        raise ValueError("Distinct scale symbols must have distinct names.")
+    _validate_scale_symbols(fixed_K.values(), X, V)
     # species index -> symbol
     fixed_K_idx = {i: fixed_K[X[i]] for i in range(n) if X[i] in fixed_K}
     base_syms = _unique_ordered([fixed_K_idx[i] for i in sorted(fixed_K_idx.keys())])
@@ -192,10 +194,7 @@ def process_CRN(
     if not find_example_nondim:
         return _finish(ret)
 
-    # If there are free species but we have no base symbols, we cannot assign choices (same behaviour as enumerator).
     free_indices = [i for i in range(n) if i not in fixed_K_idx]
-    if not base_syms and free_indices:
-        return _finish(ret)  # no families possible
 
     # Non-numeric constrained streamer
     if base_syms:

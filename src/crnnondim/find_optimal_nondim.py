@@ -20,6 +20,8 @@ from .utils import (
     _parse_monomial_key_to_exponents,
     export_crnnondim_results,
     _normalise_dimensionally_consistent_sets,
+    _normalise_symbol_mapping,
+    _validate_scale_symbols,
 )
 from ._LEXIWrapper import _LEXIWrapper
 from .process_CRN import process_CRN
@@ -156,53 +158,19 @@ def _dependent_optimal_choices(
                 half_range[i] + np.abs(log_scales - midpoint[i])
             )
     else:
-        costs = np.empty((n, len(base_syms)), dtype=float)
+        costs = np.zeros((n, len(base_syms)), dtype=float)
         for i in range(n):
-            if i in fixed_labels:
-                costs[i, :] = 0.0
-                continue
-            try:
-                x0_i = float(x0_numeric.get(X[i], 0.0))
-            except Exception:
-                x0_i = 0.0
-            if x0_i != 0.0:
-                costs[i, :] = np.arange(len(base_syms), dtype=float)
-            else:
+            if i not in fixed_labels:
                 costs[i, :] = _maximum_ranks(float(Xmax[i]), K_candidates, tol)
 
-    if nondim_metric == "deviation":
-        def compare_costs(first, second):
-            return _compare_sorted_costs(first, second, tol)
+    def compare_costs(first, second):
+        return _compare_sorted_costs(first, second, tol)
 
-        def merge_costs(first, second):
-            return _merge_sorted_costs(first, second)
+    def merge_costs(first, second):
+        return _merge_sorted_costs(first, second)
 
-        def one_cost(i, label):
-            return (float(costs[i, label]),)
-    else:
-        def compare_costs(first, second):
-            for first_item, second_item in zip(first, second):
-                first_index, first_value = first_item
-                second_index, second_value = second_item
-                if first_index != second_index:
-                    raise RuntimeError(
-                        "Order-1 costs have inconsistent species indices."
-                    )
-                if first_value < second_value:
-                    return -1
-                if first_value > second_value:
-                    return 1
-            if len(first) < len(second):
-                return -1
-            if len(first) > len(second):
-                return 1
-            return 0
-
-        def merge_costs(first, second):
-            return tuple(sorted((*first, *second), key=lambda item: item[0]))
-
-        def one_cost(i, label):
-            return ((i, float(costs[i, label])),)
+    def one_cost(i, label):
+        return (float(costs[i, label]),)
 
     local_cache: Dict[Tuple[int, int], Tuple[Any, Any]] = {}
 
@@ -488,8 +456,11 @@ def find_optimal_nondim(
         S (sp.Matrix): Stoichiometric matrix of the CRN.
         V (List[sp.Expr]): Reaction-rate monomials V_j(X).
         X (List[sp.Symbol]): Species symbols corresponding to S's rows.
-        fixed_K (Optional[Dict[sp.Symbol, sp.Symbol]]): Optional mapping
+        fixed_K (Optional[Dict[sp.Symbol, sp.Symbol]]): Nonempty mapping
             species_symbol -> fixed scale symbol, imposing partial choices.
+            Required unless pre supplies these choices. Candidate scale values
+            are the positive initial values of the fixed species, not arbitrary
+            positive numbers; O(1) trajectories are not always attainable.
         k_numeric (Optional[Dict[sp.Symbol, float]]): Numeric values for rate
             constants; required for simulation-based objectives.
         x0_numeric (Optional[Dict[sp.Symbol, float]]): Numeric initial
@@ -503,10 +474,12 @@ def find_optimal_nondim(
             whether negative exponents are allowed.
         nondim_metric (str): Optimisation metric used to choose the per-species
             scale assignment. "deviation" minimises O(1) penalty lexicographically;
-            "maximum" chooses, for zero-initial-condition species, the smallest
+            "maximum" chooses, for every unfixed species, the smallest
             admissible scale whose simulated window maximum keeps non-dimensional
             variables <= 1 over the interval [T_min, T_max]; if none does, the
-            largest allowed value is preferred. Equal numerical values retain
+            largest allowed value is preferred. Coupled assignments minimise the
+            descending vector of numerical preference ranks, not species order.
+            Fixed scales are not changed and may violate the bound. Equal values retain
             all allowed symbolic labels for subsequent coefficient scoring.
             For Cartesian restrictions, linear scans select each coordinate's
             preferred values before the tied assignments are streamed lazily.
@@ -542,6 +515,10 @@ def find_optimal_nondim(
         Dict[str, Any]: A dictionary describing the selected optimal family,
         including generator rank, uniqueness counts, selected objective
         values, assignment diagnostics and the chosen nondimensionalisation.
+        max_objective is the achieved base-10 logarithmic deviation penalty;
+        only "deviation" minimises it. In "maximum" mode it is infinite when
+        a window minimum is nonpositive. Numerical extrema are approximate;
+        solver_opts['max_step'] can tighten temporal resolution.
     """
 
     # Validate before preprocessing/integration. A singleton stays serial.
@@ -573,6 +550,10 @@ def find_optimal_nondim(
             not hasattr(fixed_K, "items") or not set(fixed_K).issubset(set(X))
             or not all(isinstance(scale, sp.Symbol) for scale in fixed_K.values())):
         raise ValueError("fixed_K must map species in X to SymPy scale symbols.")
+    if pre is None and not fixed_K:
+        raise ValueError("fixed_K must contain at least one fixed species scale unless pre supplies it.")
+    if fixed_K:
+        _validate_scale_symbols(fixed_K.values(), X, V)
     allowed_nondim_metrics = ("deviation", "maximum")
     nondim_metric = str(nondim_metric).strip().lower()
     if nondim_metric not in allowed_nondim_metrics:
@@ -600,6 +581,8 @@ def find_optimal_nondim(
         raise ValueError(f"Dimension mismatch: S has {S.cols} columns but there are {len(V)} reactions in V.")
     # Per-reaction rate symbols (returned at the end for compatibility)
     ks = _infer_ks_from_V(V, X)
+    k_numeric = _normalise_symbol_mapping(k_numeric, ks, "k_numeric", require_all=True)
+    x0_numeric = _normalise_symbol_mapping(x0_numeric, X, "x0_numeric", require_all=True)
     # --- Structural preprocessing & component analysis (reuse process_CRN) ---------
     # Optionally reuse precomputed structural data (components, nu, etc.).
     # This bundles the mass-action parsing, P/nu construction, and component-level
@@ -657,17 +640,9 @@ def find_optimal_nondim(
     fixed_K_idx = pre.get("fixed_K_indexed", {}) or {}
     base_syms = pre.get("base_symbols", [])
     free_indices = [i for i in range(n) if i not in fixed_K_idx]
-    # If no base symbols exist and there are free species, nothing to assign => no families
-    if not base_syms and free_indices:
-        return _finish({
-            "num_unique_coefficients": None,
-            "num_generators": None,
-            "families": [],
-            "P": P,
-            "nu": nu,
-            "rate_constants": ks,
-            "_S": S, "_X": X
-        })
+    if not fixed_K_idx or not base_syms:
+        raise ValueError("pre must contain at least one fixed species scale.")
+    _validate_scale_symbols(base_syms, X, V)
     # Restrictions and label mapping
     restrictions = pre.get("restrictions", [None] * n)
     labels = [str(s) for s in base_syms]
@@ -687,8 +662,6 @@ def find_optimal_nondim(
         )
     eps = 1e-300
     # --- Prepare numeric candidates for base scales K_l ----------------------------
-    if not base_syms:
-        raise ValueError("No base (fixed) K symbols available; cannot enumerate choices.")
     extra_rhs_numeric: Dict[sp.Symbol, float] = {}
     for i, s in fixed_K_idx.items():
         if x0_numeric is None or X[i] not in x0_numeric or x0_numeric[X[i]] is None:
@@ -732,23 +705,16 @@ def find_optimal_nondim(
             for i in range(n):
                 if i in fixed_K_idx:
                     continue
-                try:
-                    x0_i = float(x0_numeric.get(X[i], 0.0))
-                except Exception:
-                    x0_i = 0.0
-                if x0_i != 0.0:
-                    dimensional_costs[i, :] = np.arange(len(base_syms), dtype=float)
-                else:
-                    dimensional_costs[i, :] = _maximum_ranks(float(Xmax[i]), K_candidates)
+                dimensional_costs[i, :] = _maximum_ranks(float(Xmax[i]), K_candidates)
 
             def dimensional_choice_cost(choice):
-                return tuple(
-                    (i, float(dimensional_costs[i, label_index[str(choice[i])]]))
-                    for i in range(n)
-                )
+                return tuple(sorted(
+                    (float(dimensional_costs[i, label_index[str(choice[i])]])
+                     for i in range(n)),
+                    reverse=True,
+                ))
 
-            def dimensional_cost_compare(first, second):
-                return -1 if first < second else (1 if first > second else 0)
+            dimensional_cost_compare = _compare_sorted_costs
 
         choices = _LEXIWrapper(labels, restrictions).stream()
     elif pre.get("_assignment_analysis") is not None:
@@ -792,12 +758,6 @@ def find_optimal_nondim(
                 if i in fixed_K_idx:
                     choice_maximum[i] = [str(fixed_K_idx[i])]
                     continue
-                try:
-                    x0_i = float(x0_numeric.get(X[i], 0.0))
-                except Exception:
-                    x0_i = 0.0
-                if x0_i != 0.0:
-                    continue
                 allowed_labels = allowed[i]
                 if not allowed_labels:
                     raise ValueError(f"No admissible scale choices are available for species {X[i]}.")
@@ -813,20 +773,6 @@ def find_optimal_nondim(
                     lab for lab, value in zip(allowed_labels, values) if value == best_value
                 ]
             choices = _LEXIWrapper(labels, choice_maximum).stream()
-    # --- One-time structural invariants (avoid recomputing per choice) -------------
-    E = [(i, j) for i in range(n) for j in range(r) if P[i, j] != 0]
-    if not E:
-        return _finish({"num_unique_coefficients": 0, "num_generators": 0, "families": [], "P": P, "nu": nu, "rate_constants": ks, "_S": S, "_X": X})
-    E_map = {pair: idx for idx, pair in enumerate(E)}
-    mE = len(E)
-
-    # Build the C matrix s.t. log c_ij = log k_j + C_row * log(K)
-    C = sp.zeros(mE, n)
-    for idx, (i, j) in enumerate(E):
-        C[idx, i] -= 1
-        for l in range(n):
-            C[idx, l] += nu[l, j]
-
     choice_iterator = iter(choices)
     first_choice = next(choice_iterator, None)
     if first_choice is None:
@@ -898,47 +844,39 @@ def find_optimal_nondim(
                 elif symbolic_score > best_symbolic_score:
                     continue
 
-                # Attach the level-1 objective bound (noting that the objective is Rstar/log(10))
-                if search_all_assignments and nondim_metric == "deviation":
+                # Report the achieved log-deviation even when maximum mode did
+                # not optimise that metric. Zero concentrations give infinite deviation.
+                if nondim_metric == "maximum":
+                    if np.any(Xmin <= 0.0):
+                        fam["max_objective"] = float("inf")
+                    else:
+                        selected = np.array([
+                            extra_rhs_numeric[scale] for scale in fam["K_family"]["K_species"]
+                        ], dtype=float)
+                        fam["max_objective"] = float(np.max(np.maximum(
+                            np.abs(np.log10(Xmin) - np.log10(selected)),
+                            np.abs(np.log10(Xmax) - np.log10(selected)),
+                        )))
+                elif search_all_assignments:
                     fam["max_objective"] = best_dimensional_cost[0] / float(np.log(10))
                 else:
-                    fam["max_objective"] = Rstar/float(np.log(10)) if Rstar is not None else None
+                    fam["max_objective"] = Rstar / float(np.log(10))
 
-                # Numeric score based on |log10(T_max / K_T)| whenever possible
-                if (k_numeric is not None) and (T_max is not None):
-                    try:
-                        subs_numeric: Dict[sp.Symbol, float] = {}
-                        subs_numeric.update({k: float(v) for k, v in k_numeric.items()})
-                        if extra_rhs_numeric:
-                            subs_numeric.update({s: float(v) for s, v in extra_rhs_numeric.items()})
-                        K_T_val = float(sp.N(K_T_expr.subs(subs_numeric)))
-                        if (K_T_val is None) or not (K_T_val > 0.0):
-                            score_T = float("inf")
-                        else:
-                            score_T = abs(np.log10(float(T_max) / float(K_T_val)))
-                    except Exception:
-                        K_T_val = None
-                        score_T = float("inf")
-
-                    fam["K_T_numeric"] = K_T_val
-                    fam["objective_T_ratio"] = score_T
+                # A failed evaluation must not silently remove this tie-breaker.
+                subs_numeric = {k: float(v) for k, v in k_numeric.items()}
+                subs_numeric.update(extra_rhs_numeric)
+                try:
+                    K_T_val = float(sp.N(K_T_expr.subs(subs_numeric)))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError("Cannot evaluate the selected time scale numerically.") from exc
+                if not np.isfinite(K_T_val) or K_T_val <= 0.0:
+                    raise ValueError("The selected time scale must be finite and positive.")
+                fam["K_T_numeric"] = K_T_val
+                fam["objective_T_ratio"] = (
+                    abs(np.log10(T_max) - np.log10(K_T_val))
+                    if T_max > 0.0 else float("inf")
+                )
                 best_families.append(fam)
-    if best_families:
-        try:
-            min_F = min(f.get("L1_cost", float("inf")) for f in best_families)
-            best_families = [f for f in best_families if f.get("L1_cost", float("inf")) == min_F]
-        except Exception:
-            pass
-        try:
-            min_gen_F = min(f.get("gen_L1_cost", float("inf")) for f in best_families)
-            best_families = [f for f in best_families if f.get("gen_L1_cost", float("inf")) == min_gen_F]
-        except Exception:
-            pass
-        try:
-            min_time_F = min(f.get("time_L1_cost", float("inf")) for f in best_families)
-            best_families = [f for f in best_families if f.get("time_L1_cost", float("inf")) == min_time_F]
-        except Exception:
-            pass
     # Compute numeric bests based on |log10(T_max / K_T)|
     if best_families:
         finite = [

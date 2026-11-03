@@ -1,10 +1,9 @@
 [project]
 name = "CRNNondim"
-version = "1.0.0"
+version = "1.1.0"
 description = "CRNNondim library main repository"
 authors = [{ name = "Georgio Hawi", email = "georgio.hawi@sydney.edu.au" },
 {name = "Martin Wechselberger", email = "martin.wechselberger@sydney.edu.au"}]
-requires-python = ">=3.11.7,<3.13"
 readme = "README.md"
 license = "MIT"
 keywords = [
@@ -12,10 +11,15 @@ keywords = [
     "CRN",
     "non-dimensionalisation",
 ]
+requires-python = ">=3.11.7,<3.14"
+
 dependencies = [
-    "numpy>=1.26.4,<2",
-    "scipy>=1.14.0,<2",
-    "sympy>=1.13.1,<2",
+    "numpy>=1.26.4,<2; python_version < '3.13'",
+    "numpy>=2.2.4,<2.5; python_version >= '3.13'",
+    "scipy>=1.14.0,<2; python_version < '3.13'",
+    "scipy>=1.14.1,<2; python_version >= '3.13'",
+    "sympy>=1.13.1,<2; python_version < '3.13'",
+    "sympy>=1.14.0,<2; python_version >= '3.13'",
 ]
 
 [project.urls]

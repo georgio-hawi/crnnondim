@@ -2,6 +2,7 @@ from typing import List, Tuple, Dict, Any, Optional, Union
 from pathlib import Path
 import sympy as sp
 import numpy as np
+from .factor_generators_columnwise import factor_generators_columnwise
 from .utils import (
     _build_key_from_vec_global,
     _get_basis,
@@ -17,6 +18,8 @@ from .utils import (
     export_crnnondim_results,
     _normalise_dimensionally_consistent_sets,
     _scale_dimension_groups,
+    _validate_scale_symbols,
+    relabel_generators_by_first_use,
 )
 
 def process_CRN_given_nondimensionalisation(
@@ -72,9 +75,10 @@ def process_CRN_given_nondimensionalisation(
     if not set(nondim.keys()).issubset(set(X)):
         raise ValueError("All keys in 'nondim' must be species in X.")
 
-    # All values in nondim must be SymPy symbols (scaling factors).
-    if not all(isinstance(v, sp.Symbol) for v in nondim.values()):
-        raise ValueError("All nondimensionalisation scales must be SymPy symbols.")
+    missing = [str(xi) for xi in X if xi not in nondim]
+    if missing:
+        raise ValueError("Species missing from 'nondim' mapping: " + ", ".join(missing) + ".")
+    _validate_scale_symbols(nondim.values(), X, V)
     
     # Plug the chosen nondimensionalisation into the symbolic structures,
     # rebuild transformed exponent matrices and families, and return the
@@ -133,8 +137,6 @@ def process_CRN_given_nondimensionalisation(
     # --- Single "choice": the provided mapping ---
     fixed_full = {}
     for i, xi in enumerate(X):
-        if xi not in nondim:
-            raise KeyError(f"Species {xi} missing from 'nondim' mapping.")
         fixed_full[i] = nondim[xi]
 
     _, species_group = _normalise_dimensionally_consistent_sets(
@@ -172,82 +174,39 @@ def process_CRN_given_nondimensionalisation(
 
     if diff_rows:
         rows_tuple = tuple(tuple(row) for row in diff_rows)
-        _, D, Vt = _snf_with_transforms_int_cached(rows_tuple)
+        _, D, _ = _snf_with_transforms_int_cached(rows_tuple)
         diag_len = min(D.rows, D.cols)
         free_rank = sum(1 for t in range(diag_len) if D[t, t] != 0)
     else:
-        D = Vt = None
+        D = None
         free_rank = 0
 
-    # Prepare coordinate machinery (only if needed and rank > 0)
+    # Exact coordinates in a basis of the INTEGER row lattice. A rational
+    # rowspace basis alone need not span this lattice.
     coords = None
-    diags = []
+    B = sp.zeros(0, Mq.cols)
     if free_rank > 0:
-        if Vt is not None:
-            W = Mq * Vt
-            diags = [int(D[i, i]) for i in range(free_rank)]
-            coords = []
-            for eidx in range(mE):
-                row = W.row(eidx)
-                z = []
-                for i_g in range(free_rank):
-                    wi = int(row[0, i_g])
-                    di = diags[i_g]
-                    assert di != 0
-                    q, rmd = divmod(wi, di)
-                    if rmd != 0:
-                        q = sp.Rational(wi, di)
-                    if isinstance(q, int) or (hasattr(q, 'is_Integer') and q.is_Integer):
-                        z.append(int(q))
-                    else:
-                        raise ValueError("Non-integral coordinates in the integer lattice basis.")
-                coords.append(tuple(z))
-        else:
-            # Fallback coordinate calculation
-            Mq = sp.Matrix(diff_rows)
-            basis = Mq.rowspace()[:free_rank]
-            basis_int = []
-            for vec in basis:
-                denoms = [sp.denom(sp.Rational(v)) for v in vec]
-                lcm = 1
-                for d in denoms: lcm = sp.ilcm(lcm, int(d))
-                ivec = [int(sp.Rational(v) * lcm) for v in vec]
-                basis_int.append(ivec)
-            if basis_int:
-                B = sp.Matrix(basis_int)
-                # A rational rowspace basis need not span the integer row lattice.
-                # Preserve the existing seed when it is already an exact basis.
-                from sympy.matrices.normalforms import hermite_normal_form
-                lattice_basis = hermite_normal_form(Mq.T)
-                if hermite_normal_form(B.T) != lattice_basis:
-                    B = lattice_basis.T
-                    basis = [B.row(i) for i in range(B.rows)]
-                BT = B.T
-                M_diff = Mq
-                try:
-                    # These matrices contain exact integers. Avoid expression-level
-                    # row operations when solving all coordinate columns at once.
-                    Z_num, Z_den = BT.to_DM().solve_den(M_diff.T.to_DM())
-                    Z_matrix = Z_num.to_Matrix() / Z_num.domain.to_sympy(Z_den)
-                except Exception:
-                    try:
-                        Z_matrix = BT.LUsolve(M_diff.T)
-                    except Exception:
-                        Z_matrix = (BT.T * BT).LUsolve(BT.T * M_diff.T)
-                coords = []
-                for j in range(mE):
-                    z_col = Z_matrix.col(j)
-                    z = []
-                    for i in range(free_rank):
-                        zi = sp.nsimplify(z_col[i])
-                        if hasattr(zi, "q") and zi.q != 1:
-                            zi = sp.Rational(zi.p, zi.q)
-                        if not zi.is_Integer:
-                            raise ValueError("Non-integral coordinates in the integer lattice basis.")
-                        z.append(int(zi))
-                    coords.append(tuple(z))
-            else:
-                coords = [tuple(0 for _ in range(Mq.rows)) for _ in range(Mq.cols)]
+        basis_int = []
+        for vec in Mq.rowspace()[:free_rank]:
+            lcm = 1
+            for value in vec:
+                lcm = sp.ilcm(lcm, int(sp.denom(value)))
+            basis_int.append([int(value * lcm) for value in vec])
+        B = sp.Matrix(basis_int)
+        from sympy.matrices.normalforms import hermite_normal_form
+        lattice_basis = hermite_normal_form(Mq.T)
+        if hermite_normal_form(B.T) != lattice_basis:
+            B = lattice_basis.T
+        if B.rows != free_rank:
+            raise RuntimeError("Integer row-lattice rank does not match the Smith rank.")
+        Z_num, Z_den = B.T.to_DM().solve_den(Mq.T.to_DM())
+        Z_matrix = Z_num.to_Matrix() / Z_num.domain.to_sympy(Z_den)
+        coords = []
+        for j in range(mE):
+            z = list(Z_matrix.col(j))
+            if not all(value.is_Integer for value in z):
+                raise ValueError("Non-integral coordinates in the integer lattice basis.")
+            coords.append(tuple(map(int, z)))
 
     # Solve K-species symbols & x_sol (logs)
     K_species_expr = sp.Matrix([fixed_full[i] for i in range(n)])
@@ -256,44 +215,10 @@ def process_CRN_given_nondimensionalisation(
     # Generator definitions are independent of the normalised coefficient block.
     # Build them once and keep them by index, avoiding repeated string-key work.
     all_parameters = _unique_ordered(list(ks) + list(base_syms))
-    generator_exprs = [sp.Integer(1)] * free_rank
-    if free_rank > 0:
-        if Vt is not None:  # Use SNF transform if available
-            Vt_inverse = Vt.inv()
-            for i_gen in range(free_rank):
-                di = diags[i_gen] if i_gen < len(diags) else 1
-                expr = sp.Integer(1)
-                for j in range(rks):
-                    exp = di * Vt_inverse[i_gen, j]
-                    if exp != 0:
-                        expr *= k_unique[j]**exp
-                for m in range(pbs):
-                    exp = di * Vt_inverse[i_gen, rks + m]
-                    if exp != 0:
-                        expr *= base_syms[m]**exp
-                generator_exprs[i_gen] = sp.simplify(expr)
-        else:  # Fallback: reuse the rowspace basis already computed for coordinates
-            try:
-                for i_gen, vec in enumerate(basis):
-                    denoms = [sp.denom(sp.Rational(v)) for v in vec]
-                    lcm = 1
-                    for d in denoms:
-                        lcm = sp.ilcm(lcm, int(d))
-                    ivec = [int(sp.Rational(v) * lcm) for v in vec]
-                    expr = sp.Integer(1)
-                    for j in range(rks):
-                        e = ivec[j]
-                        if e != 0:
-                            expr *= k_unique[j]**e
-                    for m in range(pbs):
-                        e = ivec[rks + m]
-                        if e != 0:
-                            expr *= base_syms[m]**e
-                    generator_exprs[i_gen] = sp.simplify(expr)
-            except Exception:
-                all_params = list(ks) + list(base_syms)
-                for i_gen in range(min(free_rank, len(all_params))):
-                    generator_exprs[i_gen] = all_params[i_gen]
+    generator_exprs = [
+        sp.prod(symbol**int(exponent) for symbol, exponent in zip(all_parameters, row))
+        for row in B.tolist()
+    ]
 
     # Build families normalised on each block
     for block_idx, block in enumerate(true_partition):
@@ -354,23 +279,19 @@ def process_CRN_given_nondimensionalisation(
         # Transform to printing basis; ensure non-negative exponents by per-coordinate shift
         T, vecs_T, Am = (None, [], None)
         if vecs:
-            try:
-                if not allow_negatives:
-                    from ._polynomial_basis import polynomial_basis
-                    T, vecs_T, Am = polynomial_basis(
-                        vecs, [len(classes_by_gens[key]) for key in key_order],
-                        generator_exprs, K_T_expr,
-                    )
-                else:
-                    # F_mono counts active edges, including repeated classes.
-                    T, vecs_T, Am = _get_basis([
-                        v for key, v in zip(key_order, vecs)
-                        for _ in classes_by_gens[key]
-                    ])
-                    vecs_T = list(dict.fromkeys(vecs_T))
-            except NameError:
-                # Fallback: identity basis (no transform)
-                T, vecs_T, Am = (None, vecs, None)
+            if not allow_negatives:
+                from ._polynomial_basis import polynomial_basis
+                T, vecs_T, Am = polynomial_basis(
+                    vecs, [len(classes_by_gens[key]) for key in key_order],
+                    generator_exprs, K_T_expr,
+                )
+            else:
+                # F_mono counts active edges, including repeated classes.
+                T, vecs_T, Am = _get_basis([
+                    v for key, v in zip(key_order, vecs)
+                    for _ in classes_by_gens[key]
+                ])
+                vecs_T = list(dict.fromkeys(vecs_T))
 
         shift_vec = tuple(0 for _ in gens)
         if vecs_T:
@@ -391,19 +312,14 @@ def process_CRN_given_nondimensionalisation(
             classes_print = dict(classes_by_gens)
 
         # A strictly worse primary score cannot survive the final filtering.
-        # Prune only below the scoring-failure sentinel: later scoring errors
-        # must not turn a discarded family into a tie with the current best.
         if families:
             best_L1 = min(f["L1_cost"] for f in families)
-            try:
-                candidate_L1 = sum(
-                    len(edges) * sum(abs(e) for e in _parse_monomial_key_to_exponents(key, gens))
-                    for key, edges in classes_print.items()
-                )
-                if best_L1 < int(1e18) and candidate_L1 > best_L1:
-                    continue
-            except Exception:
-                pass
+            candidate_L1 = sum(
+                len(edges) * sum(abs(e) for e in _parse_monomial_key_to_exponents(key, gens))
+                for key, edges in classes_print.items()
+            )
+            if candidate_L1 > best_L1:
+                continue
 
         # Generator expressions in printing basis
         generator_expressions = []
@@ -460,27 +376,18 @@ def process_CRN_given_nondimensionalisation(
             raise ValueError("Cannot compute exact monomial sparsity scores for a nondimensionalisation family.") from exc
         families.append(fam_dict)
         
-    # Summaries
+    # Exact lexicographic reduction; malformed scores must not be ignored.
     if families:
-        try:
-            min_F = min(f.get("L1_cost", float("inf")) for f in families)
-            families = [f for f in families if f.get("L1_cost", float("inf")) == min_F]
-        except Exception:
-            pass
-    if families:
-        try:
-            min_gen_F = min(f.get("gen_L1_cost", float("inf")) for f in families)
-            families = [f for f in families if f.get("gen_L1_cost", float("inf")) == min_gen_F]
-        except Exception:
-            pass
-    if families:
-        try:
-            min_time_F = min(f.get("time_L1_cost", float("inf")) for f in families)
-            families = [f for f in families if f.get("time_L1_cost", float("inf")) == min_time_F]
-        except Exception:
-            pass
+        def score(family):
+            return tuple(family[key] for key in ("L1_cost", "gen_L1_cost", "time_L1_cost"))
+        best_score = min(map(score, families))
+        families = [family for family in families if score(family) == best_score]
     if families and not return_all_families:
         families = [families[0]]
+    # Establish first-use labels when creating the result, not while printing it.
+    for index, family in enumerate(families):
+        Stilde, Vtilde = factor_generators_columnwise(S, family, k_unique, nu)
+        _, _, families[index] = relabel_generators_by_first_use(Stilde, Vtilde, family)
     if families:
         min_unique = min(f.get("unique_monomial_count", 0) for f in families)
         min_free_rank = min(f.get("free_group_rank", 0) for f in families)

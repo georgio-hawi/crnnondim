@@ -47,6 +47,7 @@ class Michaelis_MentenExample(CRNExample):
             km1 * C, 
             k2 * C, 
             km2 * E * P]
+        super().__init__()
 
 
 class Kim_ForgerExample(CRNExample):
@@ -91,6 +92,7 @@ class Kim_ForgerExample(CRNExample):
             kb * C,  
             ku * C, 
         ]
+        super().__init__()
 
 class McKeithanExample(CRNExample):
     def __init__(self):
@@ -139,3 +141,4 @@ class McKeithanExample(CRNExample):
         self._V[11] = km1  * C4
         self._V[12] = km1  * C5
         self._V[13] = km1  * C6
+        super().__init__()

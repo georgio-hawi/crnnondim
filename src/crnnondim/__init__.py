@@ -37,14 +37,6 @@ def _print_citation_once() -> None:
 # Print the citation when the package is first imported
 #_print_citation_once()
 
-def _restore_public_functions() -> None:
-    from types import ModuleType
-
-    for name in __all__:
-        value = globals().get(name)
-        if isinstance(value, ModuleType) and hasattr(value, name):
-            globals()[name] = getattr(value, name)
-
 def __getattr__(name: str):
     """
     Lazy attribute loader for the crnnondim top-level API.
@@ -65,44 +57,15 @@ def __getattr__(name: str):
         )
         return globals()[name]
 
-    if name == "poly_system_to_CRN":
-        from .poly_system_to_CRN import poly_system_to_CRN as _poly_system_to_CRN
-
-        globals()["poly_system_to_CRN"] = _poly_system_to_CRN
-        _restore_public_functions()
-        return _poly_system_to_CRN
-
-    if name == "process_CRN":
-        from .process_CRN import process_CRN as _process_CRN
-
-        globals()["process_CRN"] = _process_CRN
-        _restore_public_functions()
-        return _process_CRN
-
-    if name == "process_CRN_given_nondimensionalisation":
-        from .process_CRN_given_nondimensionalisation import (
-            process_CRN_given_nondimensionalisation as _process_CRN_given_nondimensionalisation,
-        )
-
-        globals()[
-            "process_CRN_given_nondimensionalisation"
-        ] = _process_CRN_given_nondimensionalisation
-        _restore_public_functions()
-        return _process_CRN_given_nondimensionalisation
-
-    if name == "find_optimal_nondim":
-        from .find_optimal_nondim import find_optimal_nondim as _find_optimal_nondim
-
-        globals()["find_optimal_nondim"] = _find_optimal_nondim
-        _restore_public_functions()
-        return _find_optimal_nondim
-
-    if name == "analyse_results":
-        from .analyse_results import analyse_results as _analyse_results
-
-        globals()["analyse_results"] = _analyse_results
-        _restore_public_functions()
-        return _analyse_results
+    if name in (
+        "poly_system_to_CRN", "process_CRN",
+        "process_CRN_given_nondimensionalisation", "find_optimal_nondim",
+        "analyse_results",
+    ):
+        # Keep the package attribute a (callable) module, even after lazy loading.
+        # Replacing it with its function breaks `import crnnondim.name as module`.
+        from importlib import import_module
+        return import_module(f".{name}", __name__)
 
     if name in ("Michaelis_MentenExample", "Kim_ForgerExample", "McKeithanExample"):
         from . import example_CRNs as _ex

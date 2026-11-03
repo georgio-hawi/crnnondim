@@ -60,14 +60,7 @@ def factor_generators_columnwise(S: sp.Matrix,
         monom_factors.append(factors)
     # Ensure generator prints before the x-product by grouping x factors
     V_tilde = sp.Matrix([
-        (lambda _gen, _xfactors: (
-            sp.Mul(*[a for a in (
-                [_gen] + (_xfactors if _xfactors else [])
-            ) if not (a is sp.S.One or (getattr(a, 'is_one', False) is True))])
-        ))(
-            _vec_to_monom(zbar[j], gens, sym_g),
-            monom_factors[j]
-        )
+        sp.Mul(_vec_to_monom(zbar[j], gens, sym_g), *monom_factors[j])
         for j in range(r)
     ])
     # Build S_tilde with residuals

@@ -6,10 +6,9 @@
 #     the stoichiometric support (S != 0).
 #   - analyse_crn(S, V, X, K_fixed): main analyser; returns:
 #       * connected (bool)  -- from S-based connected-components
-#       * per_reaction_species_1b, components_1b (1-based lists)
 #       * components, components_species (0-based + names)
 #       * comp_info (per-component scale constraints)
-#       * distinct_rate_parameters, min_theor_gen
+#       * min_theor_gen, optional _assignment_analysis
 #   - exact assignment-dependence analysis for r_rate when required.
 #     All component logic below is driven by the S-based components.
 # -----------------------------------------------------------------------------

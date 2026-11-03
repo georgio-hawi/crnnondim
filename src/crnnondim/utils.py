@@ -7,6 +7,8 @@ import sympy as sp
 import numpy as np
 from functools import lru_cache
 from collections.abc import Mapping
+# Bound caches so repeated model analyses do not retain every past model.
+_BASIS_CACHE_SIZE = 256
 # Cached integer-basis transformations.
 _basis_cache: Dict[Tuple[Tuple[int, ...], ...], Tuple[List[List[int]], List[Tuple[int, ...]], 'sp.Matrix']] = {}
 
@@ -44,6 +46,8 @@ def _get_basis(vecs: List[Tuple[int, ...]]):
         entry = (T, vecs_T, Am)
     else:
         entry = (None, list(vecs), None)
+    if len(_basis_cache) >= _BASIS_CACHE_SIZE:
+        _basis_cache.pop(next(iter(_basis_cache)))
     _basis_cache[k] = entry
     T, vecs_T, Am = entry
     return ([row[:] for row in T] if T is not None else None,
@@ -60,6 +64,46 @@ def _unique_ordered(seq):
         List[Any]: List of unique elements in the order of first appearance.
     """
     return list(dict.fromkeys(seq))
+
+def _normalise_symbol_mapping(values, symbols, name, *, require_all=False):
+    """Resolve unambiguous symbol/string keys by name without changing inputs."""
+    if not isinstance(values, Mapping):
+        raise ValueError(f"{name} must be a mapping keyed by symbols or their names.")
+    symbols = _unique_ordered(symbols)
+    by_name = {}
+    for symbol in symbols:
+        if symbol.name in by_name and by_name[symbol.name] != symbol:
+            raise ValueError(f"Distinct model symbols share the name {symbol.name!r}.")
+        by_name[symbol.name] = symbol
+    result = {}
+    for key, value in values.items():
+        canonical = by_name.get(str(key), key)
+        if canonical in result and result[canonical] != value:
+            raise ValueError(f"Conflicting values for {canonical} in {name}.")
+        result[canonical] = value
+    if require_all:
+        missing = [str(symbol) for symbol in symbols if symbol not in result]
+        if missing:
+            raise ValueError(f"{name} is missing values for: {', '.join(missing)}.")
+    return result
+
+
+def _validate_scale_symbols(scales, X, V):
+    """Keep scale names independent of species and rate-parameter names."""
+    scales = list(scales)
+    if not all(isinstance(scale, sp.Symbol) for scale in scales):
+        raise ValueError("All nondimensionalisation scales must be SymPy symbols.")
+    if len(set(map(str, scales))) != len(set(scales)):
+        raise ValueError("Distinct scale symbols must have distinct names.")
+    model_names = {str(x) for x in X}
+    model_names.update(str(symbol) for v in V for symbol in sp.sympify(v).free_symbols)
+    collisions = sorted({str(scale) for scale in scales} & model_names)
+    if collisions:
+        raise ValueError(
+            "Scale symbols must have names distinct from species and rate constants: "
+            + ", ".join(collisions) + "."
+        )
+
 
 def _normalise_dimensionally_consistent_sets(
     X: List[sp.Symbol],
@@ -453,6 +497,10 @@ def _simulate(
     The interval from 0 to T_min is treated as burn-in.  If T_min is strictly
     between 0 and T_max, a second integration is started at T_min so that both
     endpoints of the observation window are included in the range calculation.
+    By default, dense output samples each adaptive step and refines bracketed
+    stationary points. These are numerical extrema, not certified bounds; use
+    max_step to resolve fast transients. dense_output=False explicitly requests
+    the cheaper adaptive-node-only estimate.
 
     Args:
         S (sp.Matrix): Stoichiometric matrix of the CRN.
@@ -477,16 +525,24 @@ def _simulate(
     )
     if solver_opts is not None:
         opts.update(solver_opts)
-    opts.setdefault("dense_output", False)
+    opts.setdefault("dense_output", True)
     # Build a numerical rhs and integrate the burn-in and observation windows.
+    x0_numeric = _normalise_symbol_mapping(x0_numeric, X, "x0_numeric", require_all=True)
     y0 = np.array([float(x0_numeric[xi]) for xi in X], dtype=float)
-    # Build RHS and Jacobian, unless the user has overridden them
+    if not np.all(np.isfinite(y0)):
+        raise ValueError("Initial concentrations must have finite numerical values.")
     rhs, jac, jac_sparsity = build_rhs_and_jac(S, V, X, ks, k_numeric)
-    if "jac" not in opts:
-        opts["jac"] = jac
-    if "jac_sparsity" not in opts:
-        # Radau/BDF can use this to speed up factorisations
-        opts["jac_sparsity"] = jac_sparsity
+    method = opts.get("method", "Radau")
+    # Explicit RK solvers do not use a Jacobian. LSODA uses a dense Jacobian
+    # unless the caller requests its packed banded representation.
+    if method in ("Radau", "BDF", "LSODA") and not (
+        method == "LSODA" and ("lband" in opts or "uband" in opts)
+    ):
+        opts.setdefault("jac", jac)
+    if method in ("Radau", "BDF") and opts.get("jac") is None:
+        opts.setdefault("jac_sparsity", jac_sparsity)
+    else:
+        opts.pop("jac_sparsity", None)
 
     T_min = float(T_min)
     T_max = float(T_max)
@@ -495,7 +551,7 @@ def _simulate(
     if opts.get("t_eval") is not None:
         raise ValueError(
             "solver_opts['t_eval'] is not supported because extrema are "
-            "computed from the solver's adaptive nodes."
+            "computed from adaptive steps and their dense interpolant."
         )
 
     if 0.0 < T_min < T_max:
@@ -541,6 +597,30 @@ def _simulate(
 
     Xmins = np.min(Yw, axis=1)
     Xmaxs = np.max(Yw, axis=1)
+    if T_min < T_max and sol_window.sol is not None:
+        # Include adaptive endpoints and three interior points per step.
+        times = sol_window.t
+        grid = np.unique(np.concatenate([
+            times,
+            *(times[:-1] + fraction * np.diff(times) for fraction in (0.25, 0.5, 0.75)),
+        ]))
+        dense_y = sol_window.sol(grid)
+        Xmins = np.minimum(Xmins, np.min(dense_y, axis=1))
+        Xmaxs = np.maximum(Xmaxs, np.max(dense_y, axis=1))
+        slopes = rhs(0.0, dense_y)  # autonomous vector field, evaluated in a batch
+        from scipy.optimize import brentq
+        for i in range(len(X)):
+            crossings = np.flatnonzero(
+                ((slopes[i, :-1] < 0) & (slopes[i, 1:] > 0))
+                | ((slopes[i, :-1] > 0) & (slopes[i, 1:] < 0))
+            )
+            for j in crossings:
+                root = brentq(lambda t: rhs(t, sol_window.sol(t))[i], grid[j], grid[j + 1])
+                value = float(sol_window.sol(root)[i])
+                Xmins[i] = min(Xmins[i], value)
+                Xmaxs[i] = max(Xmaxs[i], value)
+    if not np.all(np.isfinite(Xmins)) or not np.all(np.isfinite(Xmaxs)):
+        raise ValueError("The simulated concentration ranges must be finite.")
     return {"Xmin": Xmins, "Xmax": Xmaxs}
 
 def as_matrix(obj) -> sp.Matrix:
@@ -595,7 +675,7 @@ def has_all_zero_row_or_col(M: sp.Matrix) -> bool:
         M (sp.Matrix): The SymPy matrix to check.
 
     Returns:
-        True if M has at least one all-zero row and all-zero column, False otherwise
+        True if M has at least one all-zero row or all-zero column, False otherwise
     """
 
     # Since M will be a matrix of integers, converting to numpy is faster.
@@ -648,12 +728,12 @@ def _infer_ks_from_V(V, X):
     for j, Vj in enumerate(V):
         # Symbols that are not species (i.e., parameters)
         params = [s for s in Vj.free_symbols if s not in Xset]
-        if len(params) == 0: 
-            raise ValueError("Rate constants must be independent symbolic parameters; reaction V[%d] appears to have rate constant 1 or be missing a symbolic constant." % j)
         if len(params) != 1:
             raise ValueError(
-                f"Cannot infer a unique k_j for V[{j}]. "
-                f"Expected exactly one non-species symbol, found: {params}"
+                f"V[{j}] = {Vj} must contain exactly one independent symbolic "
+                "rate parameter for nondimensionalisation. Parameter-free terms "
+                "and products of parameters are not supported by this analysis; "
+                "poly_system_to_CRN preserves them but does not make them independent."
             )
         ks.append(params[0])
     return ks
@@ -703,7 +783,7 @@ def parse_mass_action(
             pass
     return sp.Matrix(nu), ks
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=256)
 def _snf_with_transforms_int_cached(rows_tuple):
     """
     Cached integer Smith Normal Form with transform matrices.
@@ -725,67 +805,18 @@ def _snf_with_transforms_int_cached(rows_tuple):
                  for matrix in _snf_with_transforms_int(M))
 
 def _snf_diagonal_matrix_int(M: sp.Matrix) -> sp.Matrix:
-    from sympy.polys.matrices import DomainMatrix
-    from sympy.polys.domains import ZZ as DM_ZZ
-    from sympy.polys.matrices.normalforms import smith_normal_form as dm_snf
-    from sympy.matrices.normalforms import smith_normal_form as mat_snf
-    """
-    Compute the diagonal SNF of an integer matrix M using fast backends.
+    """Return the exact integer Smith diagonal (not transformation matrices)."""
+    from sympy.matrices.normalforms import smith_normal_form
+    return smith_normal_form(M, domain=sp.ZZ)
 
-    Args:
-        M (sp.Matrix): Integer matrix.
-
-    Returns:
-        sp.Matrix: Diagonal matrix D containing the Smith invariants.
-    """
-    # Prefer DomainMatrix-based implementation, fall back to matrix-based SNF.
-    try:
-        DM = DomainMatrix.from_Matrix(M, DM_ZZ)
-        D_DM = dm_snf(DM)              # diagonal DomainMatrix
-        return D_DM.to_Matrix()
-    except Exception:
-        pass  # fall back to matrices backend
-    # Fallback: matrices backend; may return a tuple (U,D,V) or similar
-    ret = mat_snf(M, domain=sp.ZZ)
-    # If a tuple, find the diagonal among returned matrices
-    if isinstance(ret, tuple):
-        mats = [x for x in ret if isinstance(x, sp.MatrixBase)]
-        for mat in mats:
-            try:
-                if mat.is_diagonal():
-                    return mat
-            except Exception:
-                continue
-        return mats[-1]
-    try:
-        return sp.Matrix(ret)
-    except Exception:
-        return ret.to_Matrix()
 
 def _snf_with_transforms_int(M: sp.Matrix):
-    from sympy.matrices.normalforms import smith_normal_form as mat_snf
-    """
-    Compute integer SNF with left/right unimodular transforms if possible.
+    """Return (None, D, None); SymPy's matrix SNF API returns only D.
 
-    Args:
-        M (sp.Matrix): Integer matrix to decompose.
-
-    Returns:
-        Tuple[Optional[sp.Matrix], sp.Matrix, Optional[sp.Matrix]]:
-            (U, D, V) with D the SNF diagonal and U, V unimodular integer
-            matrices where available.
+    The caller obtains exact coordinates from the integer row lattice instead
+    of relying on unavailable Smith transformation matrices.
     """
-    # Wrap the diagonal SNF computation and track transform matrices.
-    try:
-        ret = mat_snf(M, domain=sp.ZZ)
-        if isinstance(ret, tuple) and len(ret) >= 3:
-            U, D, V = ret[0], ret[1], ret[2]
-            return U, D, V
-        D = sp.Matrix(ret)
-        return None, D, None
-    except Exception:
-        D = _snf_diagonal_matrix_int(M)
-        return None, D, None
+    return None, _snf_diagonal_matrix_int(M), None
 
 def monomial_str(exp_tuple: Tuple[int, ...], gens: List[str]) -> str:
     """
@@ -831,7 +862,7 @@ def _key_to_vec(key: str, gens: List[str]) -> Tuple[int, ...]:
         Tuple[int, ...]: Integer exponents for each generator in gens.
     """
     # Parse the key and extract integer exponents in the gens order.
-    """empty/1 -> all zeros."""
+    # Empty/1 denotes the zero exponent vector.
     if not key or key.strip() == "1":
         return tuple(0 for _ in gens)
     exp = {g: 0 for g in gens}
@@ -995,55 +1026,26 @@ def _parse_monomial_key_to_exponents(key: str, gens: List[str]) -> List[int]:
     # SymPy prints powers as "**"; normalise to this parser's "^" syntax.
     key = key.replace('**', '^')
     
-    # Step 1: Split into numerator (positive) and denominators (negative)
-    # Logic: "A/B/C" -> A is pos, B is neg, C is neg.
-    div_parts = key.split('/')
-    
-    # The first part is always the numerator (multiplier +1)
-    numerator_str = div_parts[0]
-    parts_to_process = [(numerator_str, 1)]
-    
-    # All subsequent parts are denominators (multiplier -1)
-    for denom_str in div_parts[1:]:
-        parts_to_process.append((denom_str, -1))
-
-    # Step 2: Process each part
-    for part_str, sign_multiplier in parts_to_process:
-        # Remove grouping parentheses (e.g., "(T_0*km1)" -> "T_0*km1")
-        clean_part = part_str.replace('(', '').replace(')', '').strip()
-        
-        if not clean_part:
+    for token in key.split('*'):
+        token = token.strip()
+        if not token:
             continue
-            
-        tokens = clean_part.split('*')
-        
-        for token in tokens:
-            token = token.strip()
-            if not token:
-                continue
-            
-            # Separate base from exponent (e.g., "x^2" -> base="x", exp=2)
-            if '^' in token:
-                base, exp_str = token.rsplit('^', 1)
-                try:
-                    val = int(exp_str)
-                except ValueError:
-                    raise ValueError("Monomial exponents must be integers.") from None
-            else:
-                base = token
-                val = 1
-            
-            # Apply to vector
-            if base in gen_map:
-                idx = gen_map[base]
-                # If sign_multiplier is -1 (denominator), we subtract the exponent
-                exps[idx] += (val * sign_multiplier)
-            elif base != '1':
-                raise ValueError(f"Unknown monomial generator: {base}")
+        if '^' in token:
+            base, exp_str = token.rsplit('^', 1)
+            try:
+                val = int(exp_str)
+            except ValueError:
+                raise ValueError("Monomial exponents must be integers.") from None
+        else:
+            base, val = token, 1
+        if base in gen_map:
+            exps[gen_map[base]] += val
+        elif base != '1':
+            raise ValueError(f"Unknown monomial generator: {base}")
 
     return exps
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=128)
 def _build_symbolic_rhs_and_jacobian(
     S_key: Tuple[Tuple[sp.Expr, ...], ...],
     V_key: Tuple[sp.Expr, ...],
@@ -1085,9 +1087,12 @@ def build_rhs_and_jac(
 
     f_sym, J_sym = _build_symbolic_rhs_and_jacobian(S_key, V_key, X_key)
 
-    # Parameter ordering
-    ks = list(ks)
-    k_vec = [k_numeric[k] for k in ks]
+    # Resolve numeric keys to the model's symbols, including their assumptions.
+    ks = _unique_ordered(ks)
+    k_numeric = _normalise_symbol_mapping(k_numeric, ks, "k_numeric", require_all=True)
+    k_vec = [float(k_numeric[k]) for k in ks]
+    if not np.all(np.isfinite(k_vec)):
+        raise ValueError("Rate constants must have finite numerical values.")
 
     # Lambdify f and J; they take (X, ks) -> f / J
     f_lam = sp.lambdify((X, ks), f_sym, modules="numpy")

@@ -5,7 +5,7 @@ from .utils import format_sympy_matrix, _build_rate_and_species_orders, _format_
 import sympy as sp
 import re
 Number = Union[int, float]
-Rate = Union[str, Number, sp.Symbol]
+Rate = Union[str, Number, sp.Expr]
 
 @dataclass
 class Reaction:
@@ -20,7 +20,7 @@ class Reaction:
         products (Dict[str, int]): Mapping species name -> stoichiometric
             coefficient on the right-hand side.
         k (Rate): Mass-action rate parameter, which can be a string name,
-            a number, or a sympy.Symbol.
+            a number, a sympy.Symbol, or a symbolic rate expression.
     """
     reactants: Dict[str, int]
     products: Dict[str, int]
@@ -72,7 +72,7 @@ def reaction(eq: str, k: Rate) -> Reaction:
         eq (str): Reaction equation using '->' for an irreversible arrow,
             e.g. '2A + B -> C'. Must not contain '<->'.
         k (Rate): Rate parameter for this reaction. May be a string name,
-            a numeric constant, or a sympy.Symbol.
+            a numeric constant, a sympy.Symbol, or a symbolic rate expression.
 
     Returns:
         Reaction: Dataclass instance with parsed reactants, products,
@@ -82,6 +82,8 @@ def reaction(eq: str, k: Rate) -> Reaction:
     if "<->" in eq:
         raise ValueError("Use reversible() for reversible arrows '<->'")
     # Split into left- and right-hand sides and parse each side
+    if eq.count("->") != 1 or "<" in eq or "=>" in eq:
+        raise ValueError("An irreversible reaction must contain exactly one '->' arrow.")
     lhs, rhs = eq.split("->")
     return Reaction(_parse_side(lhs), _parse_side(rhs), k)
 
@@ -102,6 +104,8 @@ def reversible(eq: str, kf: Rate, kr: Rate) -> List[Reaction]:
     """
     arrow = "<->"
     # Split at the reversible arrow and build both directions
+    if eq.count(arrow) != 1 or "->" in eq.replace(arrow, "") or "=>" in eq:
+        raise ValueError("A reversible reaction must contain exactly one '<->' arrow.")
     lhs, rhs = eq.split(arrow)
     r1 = Reaction(_parse_side(lhs), _parse_side(rhs), kf)
     r2 = Reaction(_parse_side(rhs), _parse_side(lhs), kr)
@@ -112,6 +116,11 @@ def build_mass_action_system(reactions: Sequence[Reaction], verbose:bool = True)
     """
     Construct the symbolic mass-action system (S, V, X, parameters) for a CRN.
 
+    Rational numerical prefactors such as 2*k are moved into S. The downstream
+    nondimensionalisation routines require one independent symbolic rate per
+    monomial; parameter-free rates and products of parameters are not supported.
+    Numeric mappings may use the returned symbols, or unambiguous symbol names.
+
     Args:
         reactions (Sequence[Reaction]): Iterable of Reaction objects
             describing the network.
@@ -120,7 +129,8 @@ def build_mass_action_system(reactions: Sequence[Reaction], verbose:bool = True)
     Returns:
         Dict[str, Any]: Dictionary with keys:
             - 'species' (List[str]): Sorted list of species names.
-            - '_S' (sp.Matrix): Stoichiometric matrix (n_species x n_reactions).
+            - '_S' (sp.Matrix): Stoichiometric matrix (n_species x n_reactions),
+              including any rational numeric rate prefactors.
             - '_X' (List[sp.Symbol]): Sympy symbols for species concentrations.
             - '_V' (sp.Matrix): Column vector of reaction-rate monomials.
             - 'rate_constants' (Tuple[sp.Symbol, ...]): Tuple of distinct
@@ -151,31 +161,37 @@ def build_mass_action_system(reactions: Sequence[Reaction], verbose:bool = True)
     # Create one nonnegative sympy symbol per species
     x_syms = [sp.symbols(s, nonnegative=True) for s in species]
 
-    def _as_rate_symbol(k: Rate, j: int) -> sp.Expr:
-        """
-        Convert a rate specifier into a symbolic parameter or numeric constant.
+    # Explicit symbols take precedence over string shorthand. Conflicting
+    # assumptions on two explicit same-name parameters are ambiguous.
+    rate_symbols = {}
+    for r in reactions:
+        if isinstance(r.k, str):
+            continue
+        for symbol in sp.sympify(r.k).free_symbols:
+            previous = rate_symbols.setdefault(symbol.name, symbol)
+            if previous != symbol:
+                raise ValueError(f"Rate symbols named {symbol.name!r} have conflicting assumptions.")
+    for r in reactions:
+        if isinstance(r.k, str):
+            rate_symbols.setdefault(r.k, sp.Symbol(r.k, positive=True))
+    if set(rate_symbols) & set(species):
+        raise ValueError("Rate constants and species must have distinct names.")
 
-        Args:
-            k (Rate): Rate specifier (Symbol, string name, or numeric).
-            j (int): Index of the reaction, used for default naming.
-
-        Returns:
-            sp.Expr: The symbolic or numeric rate constant.
-        """
-        if isinstance(k, sp.Symbol):
-            return k
-        if isinstance(k, str):
-            return sp.Symbol(k, positive=True)
-        return sp.sympify(k)
+    def _as_rate_symbol(k: Rate) -> sp.Expr:
+        return rate_symbols[k] if isinstance(k, str) else sp.sympify(k)
 
     # Build the V vector of mass-action monomials
     V_entries: List[sp.Expr] = []
     params_set = set()
     for j, r in enumerate(reactions):
         # Ensure each reaction gets a rate symbol (re-used if needed)
-        kj = _as_rate_symbol(r.k, j)
-        if isinstance(kj, sp.Symbol):
-            params_set.add(kj)
+        kj = _as_rate_symbol(r.k)
+        coefficient, rate = kj.as_coeff_Mul()
+        # Keep the exact vector field while allowing rates such as 2*k.
+        if rate.free_symbols and coefficient != 1:
+            S[:, j] *= sp.Rational(coefficient)
+            kj = rate
+        params_set.update(kj.free_symbols)
 
         # Multiply species symbols according to reactant stoichiometry
         monomial = sp.Integer(1)
@@ -183,7 +199,7 @@ def build_mass_action_system(reactions: Sequence[Reaction], verbose:bool = True)
             monomial *= x_syms[idx[s]] ** coeff
         V_entries.append(kj * monomial)
 
-    V = sp.Matrix(V_entries)
+    V = sp.Matrix(m, 1, V_entries)
 
     # Sort parameters by name for reproducibility
     params = tuple(sorted(list(params_set), key=lambda s: s.name))

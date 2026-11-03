@@ -11,6 +11,13 @@ def poly_system_to_CRN(
     Infer a mass-action-style CRN representation (S, V, X, parameters)
     from a polynomial ODE system x' = f(x).
 
+    This conversion preserves the vector field exactly. The downstream
+    nondimensionalisation routines additionally require one independent symbolic
+    rate parameter per term and nonzero rows/columns of S. Parameter-free terms
+    (e.g. -x), parameter products (e.g. -a*b*x), and zero equations can be
+    represented here but are not supported by that analysis. No independent
+    parameters are invented to replace fixed values or dependent products.
+
     Args:
         _X (Sequence[sp.Symbol]):
             Species symbols, in the same order as the ODEs ode_rhs.
@@ -33,6 +40,7 @@ def poly_system_to_CRN(
             - 'rate_constants' (Tuple[sp.Symbol, ...]): Tuple of distinct
               rate symbols that appear in the entries of V(x) and are not
               species.
+            - 'expanded_ODEs' (sp.Matrix): The reconstructed vector field S * V.
 
         The ordering of reactions (columns) is not guaranteed to match any
         external list; it is determined by the order in which distinct rate
@@ -104,8 +112,7 @@ def poly_system_to_CRN(
     V = sp.Matrix(m, 1, rate_exprs)
 
     # ---------------------------------------------------------------------
-    # 3. Infer rate constants as all non-species symbols appearing in V(x),
-    #    optionally augmented by the user-provided "rate_constants" hint.
+    # 3. Infer rate constants as all non-species symbols appearing in V(x).
     # ---------------------------------------------------------------------
     species_set = set(species_syms)
 
@@ -137,4 +144,5 @@ def poly_system_to_CRN(
         "_X": species_syms,
         "_V": V,
         "rate_constants": final_params,
+        "expanded_ODEs": S * V,
     }

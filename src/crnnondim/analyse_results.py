@@ -1,5 +1,5 @@
 from .factor_generators_columnwise import factor_generators_columnwise
-from .utils import format_sympy_matrix, relabel_generators_by_first_use
+from .utils import format_sympy_matrix, _unique_ordered
 import sympy as sp
 
 def _format_expr_generators(expr: sp.Expr,
@@ -79,7 +79,7 @@ def _format_expr_generators(expr: sp.Expr,
 
 def analyse_results(all_results, verbose=True):
     """
-    Summarise and pretty-print nondimensionalisation results.
+    Summarise and pretty-print nondimensionalisation results without modifying them.
 
     Args:
         all_results (dict | list[dict]): Either a single result
@@ -99,12 +99,15 @@ def analyse_results(all_results, verbose=True):
         all_results = [all_results]
 
     all_transformed_results = []
-    # Pretty-print a summary of the optimal non-dimensionalisati...amilies found and the corresponding non-dimensionalised systems.
+    # Pretty-print a summary of the optimal non-dimensionalisation families found and the corresponding non-dimensionalised systems.
     for processed_CRN_dict in all_results:
         for i,f in enumerate(processed_CRN_dict['families'],1):
             if verbose:
                 if "max_objective" in f and f["max_objective"] is not None:
-                    print("Minimum max O(1) penalty:", f.get("max_objective"))
+                    label = ("Max O(1) penalty at selected scales:"
+                             if processed_CRN_dict.get("nondim_metric") == "maximum"
+                             else "Minimum max O(1) penalty:")
+                    print(label, f["max_objective"])
                 print("Number of unique monomial coefficients:", processed_CRN_dict["num_unique_coefficients"])
                 print("Number of generators:", processed_CRN_dict["num_generators"])
 
@@ -114,7 +117,7 @@ def analyse_results(all_results, verbose=True):
                 KT_expr = f["K_family"]["K_T"]
                 # use the same ordered symbol lists as for generators
                 rate_syms = processed_CRN_dict["rate_constants"]
-                scale_syms = list(f.get("K_species", {}).values())
+                scale_syms = _unique_ordered(f["K_family"]["K_species"])
                 # print with consistent factor ordering
                 print("K_T:", _format_expr_generators(KT_expr, rate_syms, scale_syms))
                 if "K_T_numeric" in f and f["K_T_numeric"] is not None:
@@ -122,8 +125,6 @@ def analyse_results(all_results, verbose=True):
 
             # Compute the transformed (nondimensional) stoichiometry matrix and reaction vector.
             Stilde, Vtilde = factor_generators_columnwise(processed_CRN_dict["_S"], f, processed_CRN_dict["rate_constants"], processed_CRN_dict["nu"])
-            Stilde, Vtilde, f = relabel_generators_by_first_use(Stilde, Vtilde, f)
-            processed_CRN_dict["families"][i-1] = f
             if verbose:
                 # Generator (free parameter) definitions.
                 gens = f.get("generators", [])
@@ -132,7 +133,7 @@ def analyse_results(all_results, verbose=True):
                 if gens:
                     for g in gens:
                         if g in gen_exprs_print:
-                            print(f"  {g} = " + _format_expr_generators(gen_exprs_print[g], processed_CRN_dict["rate_constants"], list(f.get("K_species", {}).values())))
+                            print(f"  {g} = " + _format_expr_generators(gen_exprs_print[g], processed_CRN_dict["rate_constants"], scale_syms))
                         else:
                             print(f"  {g} = (unavailable)")
                 else:
@@ -148,16 +149,7 @@ def analyse_results(all_results, verbose=True):
                 print(format_sympy_matrix(Vtilde, "Vtilde"))
             all_transformed_results.append((Stilde, Vtilde))
             if verbose:
-                try:
-                    print(f'F_mono: {f.get("L1_cost")}')
-                except:
-                    pass
-                try:
-                    print(f'F_gen: {f.get("gen_L1_cost")}')
-                except:
-                    pass
-                try:
-                    print(f'F_time: {f.get("time_L1_cost")}')
-                except:
-                    pass
+                print(f'F_mono: {f.get("L1_cost")}')
+                print(f'F_gen: {f.get("gen_L1_cost")}')
+                print(f'F_time: {f.get("time_L1_cost")}')
     return all_transformed_results

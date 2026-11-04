@@ -1,14 +1,14 @@
 # CRNNondim
-CRNNondim is a Python library for automating the non-dimensionalisation of polynomial dynamical systems via chemical reaction networks (CRNs). It was developed by Georgio Hawi and Martin Wechselberger, with an accompanying paper available soon. Please direct all enquiries to georgio.hawi (at) sydney.edu.au.
+CRNNondim is a Python library for automating the non-dimensionalisation of polynomial dynamical systems via chemical reaction networks (CRNs). It was developed by Georgio Hawi and Martin Wechselberger, with an accompanying paper, [Algorithmic Non-dimensionalisation of Polynomial Dynamical Systems with CRNNondim](https://arxiv.org/abs/2611.04127), available on arXiv. Please direct all enquiries to georgio.hawi (at) sydney.edu.au.
 
-Given a polynomial CRN, CRNNondim helps you move from human-readable reaction lists to carefully chosen dimensionless variables and parameters. You can analyse a proposed non-dimensionalisation, or ask the library to search for one that is optimal under a precise objective (for example, keeping parameters O(1) over a chosen time window).
+Given a polynomial CRN, CRNNondim helps you move from human-readable reaction lists to carefully chosen dimensionless variables and parameters. You can analyse a proposed non-dimensionalisation, or ask the library to search for one that is optimal under a precise objective (for example, minimising the logarithmic deviation of species concentrations from unity over a chosen time window).
 
 CRNNondim provides tools to automate analysing and non-dimensionalising chemical reaction networks (CRNs). 
 CRNNondim includes functions that let you:
 - parse readable reaction network descriptions or a polynomial ODE system into a symbolic CRN-like ODE system (stoichiometry matrix `S`, reaction vector `V`, species vector `X`, and rate constants),
 - analyse CRNs to derive algebraic constraints on concentration and time scales and construct non-dimensionalisations that minimise the number of free parameters,
 - non-dimensionalise a CRN given an explicit choice of species scales, so you can test or refine hand-crafted scalings,
-- search for optimal non-dimensionalisations using typical initial conditions and rate constants, targeting O(1) parameters over a specified time window,
+- search for optimal non-dimensionalisations using typical initial conditions and rate constants, targeting species concentrations near unity over a specified time window,
 - run end-to-end worked examples such as the Vilar2002 oscillator [(BIOMD0000000035)](https://www.ebi.ac.uk/biomodels/BIOMD0000000035) and several well-known CRNs (Michaelis-Menten, Kim-Forger, McKeithan, and SEIRV models) via `full_example.py` and the scripts in `examples/`.
 
 ## Installation
@@ -29,10 +29,9 @@ uv sync
 
 ## Quick start
 
-After setting up the project with uv, run the full end-to-end example:
+From the cloned repository directory, run the full end-to-end example:
 
 ```bash
-cd crnnondim
 uv run python full_example.py
 ```
 
@@ -111,13 +110,18 @@ crnnondim/
 
 If you use this software in your research, please cite it as follows:
 
-> Georgio Hawi and Martin Wechselberger. **Algorithmic Non-dimensionalisation of Polynomial Dynamical Systems with CRNNondim**, 2026.
+> Georgio Hawi and Martin Wechselberger. **Algorithmic Non-dimensionalisation of Polynomial Dynamical Systems with CRNNondim**. [arXiv:2611.04127](https://arxiv.org/abs/2611.04127), 2026.
 
 ```bibtex
-@article{Hawi2026,
-  title = {Algorithmic Non-dimensionalisation of Polynomial Dynamical Systems with CRNNondim},
+@misc{Hawi2026,
+  title = {Algorithmic Non-dimensionalisation of Polynomial Dynamical Systems with {CRNNondim}},
   author = {Georgio Hawi and Martin Wechselberger},
   year = {2026},
+  eprint = {2611.04127},
+  archivePrefix = {arXiv},
+  primaryClass = {math.DS},
+  doi = {10.48550/arXiv.2611.04127},
+  url = {https://arxiv.org/abs/2611.04127}
 }
 ```
 

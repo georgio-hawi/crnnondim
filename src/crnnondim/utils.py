@@ -497,9 +497,9 @@ def _simulate(
     The interval from 0 to T_min is treated as burn-in.  If T_min is strictly
     between 0 and T_max, a second integration is started at T_min so that both
     endpoints of the observation window are included in the range calculation.
-    By default, dense output samples each adaptive step and refines bracketed
+    If requested, dense output samples each adaptive step and refines bracketed
     stationary points. These are numerical extrema, not certified bounds; use
-    max_step to resolve fast transients. dense_output=False explicitly requests
+    max_step to resolve fast transients. dense_output=False (the default) uses
     the cheaper adaptive-node-only estimate.
 
     Args:
@@ -525,7 +525,7 @@ def _simulate(
     )
     if solver_opts is not None:
         opts.update(solver_opts)
-    opts.setdefault("dense_output", True)
+    opts.setdefault("dense_output", False)
     # Build a numerical rhs and integrate the burn-in and observation windows.
     x0_numeric = _normalise_symbol_mapping(x0_numeric, X, "x0_numeric", require_all=True)
     y0 = np.array([float(x0_numeric[xi]) for xi in X], dtype=float)
